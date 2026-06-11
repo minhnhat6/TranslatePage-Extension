@@ -165,9 +165,74 @@
         outline: none;
         padding: 4px 0;
         border-bottom: 1px solid #3f3f46;
+        font-family: monospace;
       }
       .settings-input:focus {
         border-bottom-color: var(--accent-pink);
+      }
+      
+      .api-add-row {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 8px;
+        width: 100%;
+      }
+      .api-add-btn {
+        background: var(--card-bg);
+        border: 1px solid var(--card-border);
+        color: var(--text-primary);
+        border-radius: 6px;
+        padding: 4px 12px;
+        cursor: pointer;
+        font-size: 12px;
+        transition: background 0.2s;
+      }
+      .api-add-btn:hover:not(:disabled) {
+        background: #27272a;
+      }
+      .api-add-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .api-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        width: 100%;
+        max-height: 120px;
+        overflow-y: auto;
+      }
+      .api-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: rgba(244, 63, 94, 0.05);
+        border: 1px solid rgba(244, 63, 94, 0.2);
+        padding: 6px 10px;
+        border-radius: 6px;
+        font-size: 12px;
+        font-family: monospace;
+      }
+      .api-item .provider-badge {
+        font-size: 10px;
+        background: var(--accent-pink);
+        color: white;
+        padding: 2px 6px;
+        border-radius: 4px;
+        margin-right: 8px;
+        font-family: sans-serif;
+        font-weight: 600;
+      }
+      .api-item .delete-btn {
+        background: none;
+        border: none;
+        color: var(--text-muted);
+        cursor: pointer;
+        font-size: 14px;
+        padding: 0 4px;
+      }
+      .api-item .delete-btn:hover {
+        color: #f43f5e;
       }
 
       /* Main Action */
@@ -289,9 +354,13 @@
 
     <!-- Settings Box -->
     <div class="settings-box">
-      <div class="settings-row">
-        <span class="settings-label">API Key</span>
-        <input type="password" id="apiKey" class="settings-input" placeholder="Nhập Gemini API Key" />
+      <div class="settings-row" style="flex-direction: column; align-items: stretch; margin-bottom: 12px;">
+        <span class="settings-label" style="margin-bottom: 8px;">API Keys</span>
+        <div class="api-add-row">
+          <input type="password" id="newApiKey" class="settings-input" placeholder="Nhập API Key..." />
+          <button id="addApiBtn" class="api-add-btn">Thêm</button>
+        </div>
+        <div id="apiList" class="api-list"></div>
       </div>
       <div class="settings-row" style="margin-top: 12px; justify-content: space-between;">
         <span class="settings-label" style="width: auto; color: var(--text-primary)">Hiển thị bản gốc (Song ngữ)</span>

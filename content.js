@@ -11,6 +11,14 @@ const SKIP_ANCESTOR =
 const translatedEntries = [];
 const translationCache = new Map();
 
+// Auto-Translation state
+let dynamicObserver = null;
+let dynamicQueue = [];
+let isProcessingDynamicQueue = false;
+let activeApiKeys = [];
+let activeBilingualMode = false;
+let dynamicTimeoutId = null;
+
 function injectStyles() {
   if (document.getElementById('tp-styles')) return;
 
@@ -29,7 +37,7 @@ function injectStyles() {
       color: #f8fafc;
       font: 13px/1.4 system-ui, sans-serif;
       box-shadow: 0 8px 24px rgba(15, 23, 42, 0.25);
-      pointer-events: none;
+      cursor: pointer;
     }
 
     #tp-status-banner.tp-error {
@@ -203,8 +211,9 @@ function injectFloatingButton() {
       restoreOriginal();
       clearStatusBanner(0);
     } else {
-      chrome.storage.sync.get(['geminiApiKey', 'bilingualMode'], async ({ geminiApiKey, bilingualMode }) => {
-        if (!geminiApiKey) {
+      chrome.storage.sync.get(['apiKeys', 'bilingualMode'], async ({ apiKeys, bilingualMode }) => {
+        const keys = apiKeys || [];
+        if (keys.length === 0) {
           setStatusBanner('Vui lòng nhập API Key trong popup trước.', true);
           clearStatusBanner(6000);
           return;
@@ -213,7 +222,7 @@ function injectFloatingButton() {
           if (btn.classList.contains('tp-loading')) return;
           btn.classList.add('tp-loading');
           
-          await translatePageToVietnamese(geminiApiKey, bilingualMode);
+          await translatePageToVietnamese(keys, bilingualMode);
         } catch (error) {
           setStatusBanner(error.message, true);
           clearStatusBanner(6000);
@@ -241,16 +250,33 @@ function setStatusBanner(text, isError = false) {
   if (!banner) {
     banner = document.createElement('div');
     banner.id = 'tp-status-banner';
+    banner.addEventListener('click', () => {
+      banner.remove();
+      if (window.tpBannerTimeout) clearTimeout(window.tpBannerTimeout);
+    });
     document.documentElement.appendChild(banner);
   }
 
-  banner.textContent = text;
+  banner.textContent = text + (isError ? ' (Bấm để đóng)' : '');
   banner.classList.toggle('tp-error', isError);
+  banner.dataset.isError = isError;
 }
 
 function clearStatusBanner(delayMs = 3000) {
-  window.setTimeout(() => {
+  if (window.tpBannerTimeout) {
+    clearTimeout(window.tpBannerTimeout);
+  }
+  
+  if (delayMs === 0) {
     document.getElementById('tp-status-banner')?.remove();
+    return;
+  }
+
+  window.tpBannerTimeout = setTimeout(() => {
+    const banner = document.getElementById('tp-status-banner');
+    if (banner && banner.dataset.isError !== 'true') {
+      banner.remove();
+    }
   }, delayMs);
 }
 
@@ -323,6 +349,7 @@ function restoreOriginal() {
   }
   translatedEntries.length = 0;
   updateFloatingButtonState();
+  stopDynamicObserver();
 }
 
 function applyInPlaceTranslation(item, translatedText, bilingualMode) {
@@ -354,27 +381,155 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function translateBatch(apiKey, batch) {
-  const lines = batch.map((item) => item.trimmed);
-  const response = await chrome.runtime.sendMessage({
-    type: 'GEMINI_TRANSLATE_CHUNK',
-    apiKey,
-    lines,
+async function translateBatch(apiKeys, items) {
+  const lines = items.map(item => item.trimmed);
+
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { type: 'GEMINI_TRANSLATE_CHUNK', apiKeys, lines },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else if (response && response.error) {
+          reject(new Error(response.error));
+        } else if (response && response.ok) {
+          resolve(response.translations || {});
+        } else {
+          reject(new Error('Unknown response from background.'));
+        }
+      },
+    );
   });
-
-  if (!response?.ok) {
-    throw new Error(response?.error || 'Không thể dịch batch hiện tại.');
-  }
-
-  return response.translations;
 }
 
-async function translatePageToVietnamese(apiKey, bilingualMode) {
+function stopDynamicObserver() {
+  if (dynamicObserver) {
+    dynamicObserver.disconnect();
+    dynamicObserver = null;
+  }
+  if (dynamicTimeoutId) {
+    clearTimeout(dynamicTimeoutId);
+    dynamicTimeoutId = null;
+  }
+  dynamicQueue = [];
+  isProcessingDynamicQueue = false;
+}
+
+async function processDynamicQueue() {
+  if (isProcessingDynamicQueue || dynamicQueue.length === 0) return;
+  
+  isProcessingDynamicQueue = true;
+  const nodesToProcess = [...dynamicQueue];
+  dynamicQueue = [];
+
+  const btn = document.getElementById('tp-floating-btn');
+  if (btn) btn.classList.add('tp-loading');
+
+  try {
+    const batches = buildBatches(nodesToProcess);
+    for (const batch of batches) {
+      const translations = await translateBatch(activeApiKeys, batch);
+      batch.forEach((item, index) => {
+        const translated = translations[String(index)];
+        if (!translated) return;
+        translationCache.set(item.trimmed, translated);
+        applyInPlaceTranslation(item, translated, activeBilingualMode);
+      });
+    }
+  } catch (error) {
+    // If rate limit hits, stop observer and show error
+    stopDynamicObserver();
+    setStatusBanner(`Lỗi Auto-Translate: ${error.message}`, true);
+  } finally {
+    isProcessingDynamicQueue = false;
+    const btn = document.getElementById('tp-floating-btn');
+    if (btn) btn.classList.remove('tp-loading');
+    
+    if (dynamicQueue.length > 0) {
+      dynamicTimeoutId = setTimeout(processDynamicQueue, 1500);
+    }
+  }
+}
+
+function startDynamicObserver(apiKeys, bilingualMode) {
+  stopDynamicObserver();
+  activeApiKeys = apiKeys;
+  activeBilingualMode = bilingualMode;
+
+  dynamicObserver = new MutationObserver((mutations) => {
+    let hasNewText = false;
+    
+    for (const mutation of mutations) {
+      if (mutation.type === 'childList') {
+        mutation.addedNodes.forEach(node => {
+          if (node.nodeType === Node.TEXT_NODE) {
+            const parent = node.parentElement;
+            if (!parent || parent.closest(SKIP_ANCESTOR) || isHidden(parent)) return;
+            const original = node.nodeValue ?? '';
+            const trimmed = original.trim();
+            if (!trimmed || trimmed.length < 2 || !/[a-zA-Z]/.test(trimmed)) return;
+            if (translationCache.has(trimmed)) {
+              applyInPlaceTranslation({ node, original, trimmed }, translationCache.get(trimmed), activeBilingualMode);
+              return;
+            }
+            dynamicQueue.push({ node, original, trimmed });
+            hasNewText = true;
+          } else if (node.nodeType === Node.ELEMENT_NODE) {
+            const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+            let childNode;
+            while ((childNode = walker.nextNode())) {
+              const parent = childNode.parentElement;
+              if (!parent || parent.closest(SKIP_ANCESTOR) || isHidden(parent)) continue;
+              const original = childNode.nodeValue ?? '';
+              const trimmed = original.trim();
+              if (!trimmed || trimmed.length < 2 || !/[a-zA-Z]/.test(trimmed)) continue;
+              if (translationCache.has(trimmed)) {
+                applyInPlaceTranslation({ node: childNode, original, trimmed }, translationCache.get(trimmed), activeBilingualMode);
+                continue;
+              }
+              dynamicQueue.push({ node: childNode, original, trimmed });
+              hasNewText = true;
+            }
+          }
+        });
+      } else if (mutation.type === 'characterData') {
+        const node = mutation.target;
+        if (node.nodeType === Node.TEXT_NODE) {
+          const parent = node.parentElement;
+          if (!parent || parent.closest(SKIP_ANCESTOR) || isHidden(parent)) return;
+          const original = node.nodeValue ?? '';
+          const trimmed = original.trim();
+          if (!trimmed || trimmed.length < 2 || !/[a-zA-Z]/.test(trimmed)) return;
+          if (translationCache.has(trimmed)) {
+            applyInPlaceTranslation({ node, original, trimmed }, translationCache.get(trimmed), activeBilingualMode);
+            return;
+          }
+          dynamicQueue.push({ node, original, trimmed });
+          hasNewText = true;
+        }
+      }
+    }
+
+    if (hasNewText && !isProcessingDynamicQueue) {
+      if (dynamicTimeoutId) clearTimeout(dynamicTimeoutId);
+      dynamicTimeoutId = setTimeout(processDynamicQueue, 1500);
+    }
+  });
+
+  dynamicObserver.observe(document.body, {
+    childList: true,
+    subtree: true,
+    characterData: true
+  });
+}
+
+async function translatePageToVietnamese(apiKeys, bilingualMode) {
   injectStyles();
   restoreOriginal();
 
-  const textNodes = getTranslatableTextNodes();
-  if (!textNodes.length) {
+  try {
+    const textNodes = getTranslatableTextNodes();
+    if (!textNodes.length) {
     throw new Error('Trang không có nội dung để dịch.');
   }
 
@@ -392,23 +547,32 @@ async function translatePageToVietnamese(apiKey, bilingualMode) {
 
   if (nodesToTranslate.length > 0) {
     const batches = buildBatches(nodesToTranslate);
+    let isAborted = false;
 
     async function processBatches(iterator) {
       for (const [batchIndex, batch] of iterator) {
+        if (isAborted) return;
+
         setStatusBanner(
           `Đang dịch phần ${batchIndex + 1}/${batches.length} (${nodesToTranslate.length} đoạn mới)...`,
         );
 
-        const translations = await translateBatch(apiKey, batch);
+        try {
+          const translations = await translateBatch(apiKeys, batch);
+          if (isAborted) return;
 
-        batch.forEach((item, index) => {
-          const translated = translations[String(index)];
-          if (!translated) return;
-          
-          translationCache.set(item.trimmed, translated);
-          applyInPlaceTranslation(item, translated, bilingualMode);
-          translatedCount += 1;
-        });
+          batch.forEach((item, index) => {
+            const translated = translations[String(index)];
+            if (!translated) return;
+            
+            translationCache.set(item.trimmed, translated);
+            applyInPlaceTranslation(item, translated, bilingualMode);
+            translatedCount += 1;
+          });
+        } catch (error) {
+          isAborted = true;
+          throw error;
+        }
       }
     }
 
@@ -428,8 +592,11 @@ async function translatePageToVietnamese(apiKey, bilingualMode) {
       : `Dịch xong toàn trang (${translatedCount} đoạn).`;
 
   setStatusBanner(summary);
-  clearStatusBanner();
-  updateFloatingButtonState();
+  clearStatusBanner(6000);
+  } finally {
+    updateFloatingButtonState();
+    startDynamicObserver(apiKeys, bilingualMode);
+  }
 }
 
 function showSelectionPopup(text, selection) {
@@ -475,7 +642,7 @@ function showSelectionPopup(text, selection) {
   }, 10);
 }
 
-async function translateSelectionToVietnamese(apiKey, bilingualMode) {
+async function translateSelectionToVietnamese(apiKeys, bilingualMode) {
   const selection = window.getSelection();
   const text = selection.toString();
   if (!text.trim()) {
@@ -503,7 +670,7 @@ async function translateSelectionToVietnamese(apiKey, bilingualMode) {
   if (linesToTranslate.length > 0) {
     const response = await chrome.runtime.sendMessage({
       type: 'GEMINI_TRANSLATE_CHUNK',
-      apiKey,
+      apiKeys,
       lines: linesToTranslate.map(x => x.line),
     });
 
@@ -554,16 +721,17 @@ function initQuickTranslate() {
             ev.stopPropagation();
             quickBtn.classList.add('tp-loading');
 
-            chrome.storage.sync.get(['geminiApiKey', 'bilingualMode'], async ({ geminiApiKey, bilingualMode }) => {
-              if (!geminiApiKey) {
-                setStatusBanner('Vui lòng nhập API Key trong popup trước.', true);
+            chrome.storage.sync.get(['apiKeys', 'bilingualMode'], async ({ apiKeys, bilingualMode }) => {
+              const keys = apiKeys || [];
+              if (keys.length === 0) {
+                setStatusBanner('Vui lòng nhập API Keys trong popup trước.', true);
                 clearStatusBanner(6000);
                 quickBtn.classList.remove('tp-loading');
                 quickBtn.style.display = 'none';
                 return;
               }
               try {
-                await translateSelectionToVietnamese(geminiApiKey, bilingualMode);
+                await translateSelectionToVietnamese(keys, bilingualMode);
               } catch (error) {
                 setStatusBanner(error.message, true);
                 clearStatusBanner(6000);
@@ -616,7 +784,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message?.type === 'TRANSLATE_SELECTION') {
-    translateSelectionToVietnamese(message.apiKey, message.bilingualMode)
+    translateSelectionToVietnamese(message.apiKeys, message.bilingualMode)
       .then(() => sendResponse({ ok: true }))
       .catch((error) => {
         setStatusBanner(error.message, true);
@@ -630,7 +798,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
-  translatePageToVietnamese(message.apiKey, message.bilingualMode)
+  translatePageToVietnamese(message.apiKeys, message.bilingualMode)
     .then(() => sendResponse({ ok: true }))
     .catch((error) => {
       setStatusBanner(error.message, true);

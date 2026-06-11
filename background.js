@@ -7,7 +7,8 @@ const MODEL_FALLBACK_CHAIN = [
 
 const RETRYABLE_STATUSES = new Set([429, 500, 503, 504]);
 const MAX_RETRIES_PER_MODEL = 2;
-const exhaustedModels = new Set();
+const exhaustedConfigs = new Map(); // "apiKey|model" -> timestamp
+
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -65,18 +66,17 @@ function getExhaustedModel(errorText) {
 
 function formatUserError(status, errorText) {
   if (status !== 429) {
-    return `Gemini API lỗi (${status}): ${errorText}`;
+    return `API lỗi (${status}): ${errorText}`;
   }
 
-  if (errorText.includes('free_tier') || errorText.includes('Quota exceeded')) {
+  if (errorText.includes('free_tier') || errorText.includes('Quota exceeded') || errorText.includes('rate_limit_exceeded')) {
     return [
-      'Đã hết quota miễn phí Gemini (khoảng 20 request/ngày cho mỗi model).',
-      'Extension đã gộp trang thành ít request hơn — thử lại ngày mai,',
-      'hoặc bật billing tại https://ai.google.dev/gemini-api/docs/rate-limits',
+      'Đã hết quota hoặc giới hạn tốc độ miễn phí của API.',
+      'Hãy thử lại sau, hoặc thêm API Key khác (Gemini/Groq) vào danh sách để dự phòng.',
     ].join(' ');
   }
 
-  return 'Gemini đang giới hạn tốc độ. Đang chờ và thử lại...';
+  return 'API đang giới hạn tốc độ. Đang chờ và thử lại...';
 }
 
 function parseTranslations(translatedText) {
@@ -139,37 +139,79 @@ async function callGemini(apiKey, model, prompt) {
   return translations;
 }
 
-async function translateWithModel(apiKey, model, prompt) {
-  let lastError;
+async function callOpenAIFormat(apiUrl, apiKey, model, prompt) {
+  const response = await fetch(apiUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: model,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.2,
+    }),
+  });
 
-  for (let attempt = 0; attempt < MAX_RETRIES_PER_MODEL; attempt += 1) {
-    try {
-      return await callGemini(apiKey, model, prompt);
-    } catch (error) {
-      lastError = error;
+  if (!response.ok) {
+    const errorText = await response.text();
+    const error = new Error(formatUserError(response.status, errorText));
+    error.status = response.status;
+    error.raw = errorText;
+    throw error;
+  }
 
-      if (!RETRYABLE_STATUSES.has(error.status)) {
-        throw error;
-      }
+  const data = await response.json();
+  const translatedText = data?.choices?.[0]?.message?.content ?? '';
 
-      if (error.status === 429 && error.raw?.includes('free_tier')) {
-        exhaustedModels.add(model);
-        throw error;
-      }
+  if (!translatedText) {
+    throw new Error('API không trả về nội dung dịch.');
+  }
 
-      if (attempt === MAX_RETRIES_PER_MODEL - 1) {
-        throw error;
-      }
+  const translations = parseTranslations(translatedText);
+  if (!translations.size) {
+    throw new Error('Không parse được kết quả dịch từ API.');
+  }
 
-      const delay = error.status === 429 ? parseRetryDelayMs(error.raw) : 2000 * (attempt + 1);
-      await sleep(delay);
+  return translations;
+}
+
+function buildKeyPool(apiKeys) {
+  const pool = [];
+  
+  for (const key of apiKeys) {
+    if (key.startsWith('gsk_')) {
+      pool.push({
+        provider: 'groq',
+        priority: 1,
+        apiKey: key,
+        apiUrl: 'https://api.groq.com/openai/v1/chat/completions',
+        models: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant']
+      });
+    } else if (key.startsWith('AIza') || key.startsWith('AQ.')) {
+      pool.push({
+        provider: 'gemini',
+        priority: 2,
+        apiKey: key,
+        apiUrl: '',
+        models: ['gemini-2.0-flash', 'gemini-2.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash']
+      });
+    } else if (key.startsWith('sk-or-')) {
+      pool.push({
+        provider: 'openrouter',
+        priority: 3,
+        apiKey: key,
+        apiUrl: 'https://openrouter.ai/api/v1/chat/completions',
+        models: ['meta-llama/llama-3.3-70b-instruct:free', 'openrouter/free']
+      });
     }
   }
 
-  throw lastError;
+  pool.sort((a, b) => a.priority - b.priority);
+  return pool;
 }
 
-async function translateLines(apiKey, lines) {
+async function translateLines(apiKeys, lines) {
   const sourceText = lines.map((text, index) => `${index}|||${text}`).join('\n');
   const prompt = [
     'Translate each numbered line into Vietnamese.',
@@ -181,35 +223,102 @@ async function translateLines(apiKey, lines) {
     sourceText,
   ].join('\n\n');
 
-  const availableModels = MODEL_FALLBACK_CHAIN.filter((model) => !exhaustedModels.has(model));
+  const pool = buildKeyPool(apiKeys);
   let lastError;
 
-  for (const model of availableModels) {
-    try {
-      return await translateWithModel(apiKey, model, prompt);
-    } catch (error) {
-      lastError = error;
+  for (const config of pool) {
+    for (const model of config.models) {
+      const configId = `${config.apiKey}|${model}`;
+      const exhaustedUntil = exhaustedConfigs.get(configId) || 0;
+      
+      if (Date.now() < exhaustedUntil) continue;
 
-      const exhaustedModel = getExhaustedModel(error.raw ?? '');
-      if (exhaustedModel) {
-        exhaustedModels.add(exhaustedModel);
-      }
+      for (let attempt = 0; attempt < MAX_RETRIES_PER_MODEL; attempt += 1) {
+        try {
+          if (config.provider === 'gemini') {
+            return await callGemini(config.apiKey, model, prompt);
+          } else {
+            return await callOpenAIFormat(config.apiUrl, config.apiKey, model, prompt);
+          }
+        } catch (error) {
+          lastError = error;
 
-      if (!RETRYABLE_STATUSES.has(error.status)) {
-        throw error;
+          if (error.status === 401 || error.status === 403) {
+            // Invalid key, exhaust all models for this key forever
+            for (const m of config.models) {
+              exhaustedConfigs.set(`${config.apiKey}|${m}`, Date.now() + 365 * 24 * 60 * 60 * 1000);
+            }
+            break; 
+          }
+
+          if (error.status === 429) {
+            let penalty = parseRetryDelayMs(error.raw);
+            if (error.raw?.includes('free_tier') || error.raw?.includes('Quota exceeded')) {
+              penalty = 24 * 60 * 60 * 1000;
+            } else if (config.provider === 'groq') {
+              penalty = Math.max(penalty, 60000); // Wait at least 60s for Groq rate limits
+            }
+            exhaustedConfigs.set(configId, Date.now() + penalty);
+            break; 
+          }
+
+          if (!RETRYABLE_STATUSES.has(error.status)) {
+            break; 
+          }
+
+          if (attempt === MAX_RETRIES_PER_MODEL - 1) {
+            break; 
+          }
+
+          const delay = 2000 * (attempt + 1);
+          await sleep(delay);
+        }
       }
     }
   }
 
-  throw lastError ?? new Error('Tất cả model Gemini đều không khả dụng. Thử lại sau.');
+  throw lastError ?? new Error('Tất cả API Key và Model đều không khả dụng hoặc đã hết Quota.');
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'VERIFY_API_KEY') {
+    const config = buildKeyPool([message.apiKey])[0];
+    if (!config) {
+      sendResponse({ ok: false, error: 'Key không đúng định dạng hỗ trợ.' });
+      return false;
+    }
+    
+    // We only verify with the first model of the config
+    const model = config.models[0];
+    const prompt = 'hi';
+    
+    let verifyPromise;
+    if (config.provider === 'gemini') {
+      verifyPromise = callGemini(config.apiKey, model, prompt);
+    } else {
+      verifyPromise = callOpenAIFormat(config.apiUrl, config.apiKey, model, prompt);
+    }
+    
+    verifyPromise
+      .then(() => sendResponse({ ok: true }))
+      .catch(err => {
+        // Since we didn't send a valid translation prompt, it might fail to parse,
+        // but if it hits the parse error, the connection and auth were SUCCESSFUL!
+        if (err.message.includes('Không parse được') || err.message.includes('không trả về nội dung')) {
+          sendResponse({ ok: true });
+        } else {
+          sendResponse({ ok: false, error: err.message });
+        }
+      });
+      
+    return true;
+  }
+
   if (message?.type !== 'GEMINI_TRANSLATE_CHUNK') {
     return false;
   }
 
-  translateLines(message.apiKey, message.lines)
+  translateLines(message.apiKeys, message.lines)
     .then((translations) => {
       sendResponse({
         ok: true,
@@ -266,15 +375,16 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     return;
   }
 
-  const { geminiApiKey, bilingualMode } = await chrome.storage.sync.get(['geminiApiKey', 'bilingualMode']);
-  if (!geminiApiKey) {
-    chrome.tabs.sendMessage(tab.id, { type: 'SHOW_ERROR', message: 'Vui lòng nhập API Key trong popup trước khi dịch.' }).catch(() => {});
+  const { apiKeys, bilingualMode } = await chrome.storage.sync.get(['apiKeys', 'bilingualMode']);
+  const keys = apiKeys || [];
+  if (keys.length === 0) {
+    chrome.tabs.sendMessage(tab.id, { type: 'SHOW_ERROR', message: 'Vui lòng thêm API Key trong popup trước khi dịch.' }).catch(() => {});
     return;
   }
 
   if (info.selectionText) {
-    chrome.tabs.sendMessage(tab.id, { type: 'TRANSLATE_SELECTION', apiKey: geminiApiKey, bilingualMode }).catch(() => {});
+    chrome.tabs.sendMessage(tab.id, { type: 'TRANSLATE_SELECTION', apiKeys: keys, bilingualMode }).catch(() => {});
   } else {
-    chrome.tabs.sendMessage(tab.id, { type: 'TRANSLATE_TO_VI', apiKey: geminiApiKey, bilingualMode }).catch(() => {});
+    chrome.tabs.sendMessage(tab.id, { type: 'TRANSLATE_TO_VI', apiKeys: keys, bilingualMode }).catch(() => {});
   }
 });
