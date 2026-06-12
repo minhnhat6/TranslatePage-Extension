@@ -215,7 +215,10 @@ async function translateLines(apiKeys, lines) {
   const sourceText = lines.map((text, index) => `${index}|||${text}`).join('\n');
   const prompt = [
     'Translate each numbered line into Vietnamese.',
-    'IMPORTANT: If a line is ALREADY in Vietnamese, DO NOT translate it. Just return the original Vietnamese text exactly as it is.',
+    'IMPORTANT: Some lines contain XML-like tags (e.g. <t0>...</t0>, <t1>...</t1>). These represent fragments of a single sentence.',
+    'You MUST preserve all <tX>...</tX> tags exactly. Do not merge, delete, or change the tag names.',
+    'Translate the text inside each tag individually, but use the surrounding tags for context so the whole sentence flows naturally.',
+    'If a line is ALREADY in Vietnamese, DO NOT translate it. Just return the original text exactly as it is.',
     "Keep the index before '|||' exactly as given.",
     'Return ONLY lines formatted as: <index>|||<vietnamese_text>.',
     'Preserve meaning. Do not add notes, markdown, or blank lines.',

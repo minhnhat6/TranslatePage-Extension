@@ -291,32 +291,67 @@ function withOriginalWhitespace(original, translated) {
   return `${leading}${translated.trim()}${trailing}`;
 }
 
-function getTranslatableTextNodes() {
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  const nodes = [];
-  let node;
+const BLOCK_TAGS = new Set([
+  'DIV', 'P', 'LI', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 
+  'TD', 'TH', 'BLOCKQUOTE', 'SECTION', 'ARTICLE', 'ASIDE', 
+  'HEADER', 'FOOTER', 'TR', 'UL', 'OL', 'NAV', 'MAIN', 'FIGCAPTION', 'FIGURE'
+]);
 
+function getBlockParent(node) {
+  let curr = node.parentElement;
+  while (curr) {
+    if (BLOCK_TAGS.has(curr.tagName)) return curr;
+    curr = curr.parentElement;
+  }
+  return document.body;
+}
+
+function extractGroupsFromNode(rootNode) {
+  const walker = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
+  const groups = [];
+  let currentGroup = [];
+  let lastBlockParent = null;
+
+  let node;
   while ((node = walker.nextNode())) {
     const parent = node.parentElement;
     if (!parent || parent.closest(SKIP_ANCESTOR) || isHidden(parent)) continue;
 
     const original = node.nodeValue ?? '';
     const trimmed = original.trim();
-    if (!trimmed || trimmed.length < 2) continue;
+    if (!trimmed || trimmed.length < 2 || !/[a-zA-Z]/.test(trimmed)) continue;
 
-    nodes.push({ node, original, trimmed });
+    const blockParent = getBlockParent(node);
+    if (blockParent !== lastBlockParent) {
+      if (currentGroup.length > 0) groups.push(currentGroup);
+      currentGroup = [{ node, original, trimmed }];
+      lastBlockParent = blockParent;
+    } else {
+      currentGroup.push({ node, original, trimmed });
+    }
   }
+  if (currentGroup.length > 0) groups.push(currentGroup);
 
-  return nodes;
+  return groups;
 }
 
-function buildBatches(textNodes) {
+function getTranslatableTextNodes() {
+  return extractGroupsFromNode(document.body);
+}
+
+function buildContextString(group) {
+  if (group.length === 1) return group[0].trimmed;
+  return group.map((item, index) => `<t${index}>${item.trimmed}</t${index}>`).join(' ');
+}
+
+function buildBatches(groups) {
   const batches = [];
   let current = [];
   let currentChars = 0;
 
-  textNodes.forEach((item, globalIndex) => {
-    const lineLen = item.trimmed.length + String(globalIndex).length + 5;
+  groups.forEach((group, globalIndex) => {
+    const contextString = buildContextString(group);
+    const lineLen = contextString.length + String(globalIndex).length + 5;
 
     if (current.length && currentChars + lineLen > MAX_CHARS_PER_BATCH) {
       batches.push(current);
@@ -324,7 +359,7 @@ function buildBatches(textNodes) {
       currentChars = 0;
     }
 
-    current.push({ ...item, globalIndex });
+    current.push({ group, contextString, globalIndex });
     currentChars += lineLen;
   });
 
@@ -333,6 +368,32 @@ function buildBatches(textNodes) {
   }
 
   return batches;
+}
+
+function applyGroupTranslation(group, translatedContext, bilingualMode) {
+  if (group.length === 1) {
+    applyInPlaceTranslation(group[0], translatedContext, bilingualMode);
+    return;
+  }
+
+  let fullFallbackText = translatedContext;
+
+  for (let i = 0; i < group.length; i++) {
+    const regex = new RegExp(`<t${i}>(.*?)</t${i}>`, 's');
+    const match = translatedContext.match(regex);
+    
+    if (match) {
+      fullFallbackText = fullFallbackText.replace(match[0], '').trim();
+      applyInPlaceTranslation(group[i], match[1].trim(), bilingualMode);
+    } else {
+      if (i === 0) {
+        const plainText = translatedContext.replace(/<t\d+>.*?<\/t\d+>/gs, '').trim();
+        applyInPlaceTranslation(group[i], plainText || translatedContext, bilingualMode);
+      } else {
+        applyInPlaceTranslation(group[i], '', bilingualMode);
+      }
+    }
+  }
 }
 
 function restoreOriginal() {
@@ -382,7 +443,7 @@ function sleep(ms) {
 }
 
 async function translateBatch(apiKeys, items) {
-  const lines = items.map(item => item.trimmed);
+  const lines = items.map(item => item.contextString);
 
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
@@ -429,11 +490,11 @@ async function processDynamicQueue() {
     const batches = buildBatches(nodesToProcess);
     for (const batch of batches) {
       const translations = await translateBatch(activeApiKeys, batch);
-      batch.forEach((item, index) => {
-        const translated = translations[String(index)];
-        if (!translated) return;
-        translationCache.set(item.trimmed, translated);
-        applyInPlaceTranslation(item, translated, activeBilingualMode);
+      batch.forEach((batchItem, index) => {
+        const translatedContext = translations[String(index)];
+        if (!translatedContext) return;
+        translationCache.set(batchItem.contextString, translatedContext);
+        applyGroupTranslation(batchItem.group, translatedContext, activeBilingualMode);
       });
     }
   } catch (error) {
@@ -468,26 +529,24 @@ function startDynamicObserver(apiKeys, bilingualMode) {
             const original = node.nodeValue ?? '';
             const trimmed = original.trim();
             if (!trimmed || trimmed.length < 2 || !/[a-zA-Z]/.test(trimmed)) return;
-            if (translationCache.has(trimmed)) {
-              applyInPlaceTranslation({ node, original, trimmed }, translationCache.get(trimmed), activeBilingualMode);
+            
+            const group = [{ node, original, trimmed }];
+            const contextString = buildContextString(group);
+            if (translationCache.has(contextString)) {
+              applyGroupTranslation(group, translationCache.get(contextString), activeBilingualMode);
               return;
             }
-            dynamicQueue.push({ node, original, trimmed });
+            dynamicQueue.push(group);
             hasNewText = true;
           } else if (node.nodeType === Node.ELEMENT_NODE) {
-            const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
-            let childNode;
-            while ((childNode = walker.nextNode())) {
-              const parent = childNode.parentElement;
-              if (!parent || parent.closest(SKIP_ANCESTOR) || isHidden(parent)) continue;
-              const original = childNode.nodeValue ?? '';
-              const trimmed = original.trim();
-              if (!trimmed || trimmed.length < 2 || !/[a-zA-Z]/.test(trimmed)) continue;
-              if (translationCache.has(trimmed)) {
-                applyInPlaceTranslation({ node: childNode, original, trimmed }, translationCache.get(trimmed), activeBilingualMode);
+            const groups = extractGroupsFromNode(node);
+            for (const group of groups) {
+              const contextString = buildContextString(group);
+              if (translationCache.has(contextString)) {
+                applyGroupTranslation(group, translationCache.get(contextString), activeBilingualMode);
                 continue;
               }
-              dynamicQueue.push({ node: childNode, original, trimmed });
+              dynamicQueue.push(group);
               hasNewText = true;
             }
           }
@@ -500,11 +559,14 @@ function startDynamicObserver(apiKeys, bilingualMode) {
           const original = node.nodeValue ?? '';
           const trimmed = original.trim();
           if (!trimmed || trimmed.length < 2 || !/[a-zA-Z]/.test(trimmed)) return;
-          if (translationCache.has(trimmed)) {
-            applyInPlaceTranslation({ node, original, trimmed }, translationCache.get(trimmed), activeBilingualMode);
+          
+          const group = [{ node, original, trimmed }];
+          const contextString = buildContextString(group);
+          if (translationCache.has(contextString)) {
+            applyGroupTranslation(group, translationCache.get(contextString), activeBilingualMode);
             return;
           }
-          dynamicQueue.push({ node, original, trimmed });
+          dynamicQueue.push(group);
           hasNewText = true;
         }
       }
@@ -528,71 +590,75 @@ async function translatePageToVietnamese(apiKeys, bilingualMode) {
   restoreOriginal();
 
   try {
-    const textNodes = getTranslatableTextNodes();
-    if (!textNodes.length) {
-    throw new Error('Trang không có nội dung để dịch.');
-  }
+    const textGroups = getTranslatableTextNodes();
+    let totalNodes = 0;
+    textGroups.forEach(g => totalNodes += g.length);
 
-  const nodesToTranslate = [];
-  let translatedCount = 0;
-
-  for (const item of textNodes) {
-    if (translationCache.has(item.trimmed)) {
-      applyInPlaceTranslation(item, translationCache.get(item.trimmed), bilingualMode);
-      translatedCount += 1;
-    } else {
-      nodesToTranslate.push(item);
+    if (!totalNodes) {
+      throw new Error('Trang không có nội dung để dịch.');
     }
-  }
 
-  if (nodesToTranslate.length > 0) {
-    const batches = buildBatches(nodesToTranslate);
-    let isAborted = false;
+    const groupsToTranslate = [];
+    let translatedCount = 0;
 
-    async function processBatches(iterator) {
-      for (const [batchIndex, batch] of iterator) {
-        if (isAborted) return;
-
-        setStatusBanner(
-          `Đang dịch phần ${batchIndex + 1}/${batches.length} (${nodesToTranslate.length} đoạn mới)...`,
-        );
-
-        try {
-          const translations = await translateBatch(apiKeys, batch);
-          if (isAborted) return;
-
-          batch.forEach((item, index) => {
-            const translated = translations[String(index)];
-            if (!translated) return;
-            
-            translationCache.set(item.trimmed, translated);
-            applyInPlaceTranslation(item, translated, bilingualMode);
-            translatedCount += 1;
-          });
-        } catch (error) {
-          isAborted = true;
-          throw error;
-        }
+    for (const group of textGroups) {
+      const contextString = buildContextString(group);
+      if (translationCache.has(contextString)) {
+        applyGroupTranslation(group, translationCache.get(contextString), bilingualMode);
+        translatedCount += group.length;
+      } else {
+        groupsToTranslate.push(group);
       }
     }
 
-    const iterator = batches.entries();
-    const workers = Array.from({ length: Math.min(CONCURRENCY_LIMIT, batches.length) }, () => processBatches(iterator));
-    await Promise.all(workers);
-  }
+    if (groupsToTranslate.length > 0) {
+      const batches = buildBatches(groupsToTranslate);
+      let isAborted = false;
 
-  if (!translatedCount) {
-    throw new Error('Gemini trả về nhưng không khớp được nội dung trên trang.');
-  }
+      async function processBatches(iterator) {
+        for (const [batchIndex, batch] of iterator) {
+          if (isAborted) return;
 
-  const skipped = textNodes.length - translatedCount;
-  const summary =
-    skipped > 0
-      ? `Dịch xong ${translatedCount}/${textNodes.length} đoạn (${skipped} đoạn chưa khớp).`
-      : `Dịch xong toàn trang (${translatedCount} đoạn).`;
+          setStatusBanner(
+            `Đang dịch phần ${batchIndex + 1}/${batches.length} (${groupsToTranslate.length} đoạn mới)...`,
+          );
 
-  setStatusBanner(summary);
-  clearStatusBanner(6000);
+          try {
+            const translations = await translateBatch(apiKeys, batch);
+            if (isAborted) return;
+
+            batch.forEach((batchItem, index) => {
+              const translatedContext = translations[String(index)];
+              if (!translatedContext) return;
+              
+              translationCache.set(batchItem.contextString, translatedContext);
+              applyGroupTranslation(batchItem.group, translatedContext, bilingualMode);
+              translatedCount += batchItem.group.length;
+            });
+          } catch (error) {
+            isAborted = true;
+            throw error;
+          }
+        }
+      }
+
+      const iterator = batches.entries();
+      const workers = Array.from({ length: Math.min(CONCURRENCY_LIMIT, batches.length) }, () => processBatches(iterator));
+      await Promise.all(workers);
+    }
+
+    if (!translatedCount) {
+      throw new Error('Gemini trả về nhưng không khớp được nội dung trên trang.');
+    }
+
+    const skipped = totalNodes - translatedCount;
+    const summary =
+      skipped > 0
+        ? `Dịch xong ${translatedCount}/${totalNodes} thẻ (${skipped} thẻ chưa khớp).`
+        : `Dịch xong toàn trang (${translatedCount} thẻ).`;
+
+    setStatusBanner(summary);
+    clearStatusBanner(6000);
   } finally {
     updateFloatingButtonState();
     startDynamicObserver(apiKeys, bilingualMode);
