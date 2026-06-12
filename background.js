@@ -1,9 +1,4 @@
-const MODEL_FALLBACK_CHAIN = [
-  'gemini-2.0-flash',
-  'gemini-2.5-flash-lite',
-  'gemini-3.1-flash-lite',
-  'gemini-2.5-flash',
-];
+
 
 const RETRYABLE_STATUSES = new Set([429, 500, 503, 504]);
 const MAX_RETRIES_PER_MODEL = 2;
@@ -194,7 +189,7 @@ function buildKeyPool(apiKeys) {
         priority: 2,
         apiKey: key,
         apiUrl: '',
-        models: ['gemini-2.0-flash', 'gemini-2.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash']
+        models: ['gemini-2.0-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-flash']
       });
     } else if (key.startsWith('sk-or-')) {
       pool.push({
@@ -211,76 +206,128 @@ function buildKeyPool(apiKeys) {
   return pool;
 }
 
+let cachedApiKeysJSON = '';
+let cachedKeyPool = [];
+const activeConnections = new Map();
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function buildKeyPoolCached(apiKeys) {
+  const json = JSON.stringify(apiKeys);
+  if (json !== cachedApiKeysJSON) {
+    cachedApiKeysJSON = json;
+    cachedKeyPool = buildKeyPool(apiKeys);
+  }
+  return cachedKeyPool;
+}
+
+function cleanupExhausted() {
+  const now = Date.now();
+  for (const [configId, exhaustedUntil] of exhaustedConfigs.entries()) {
+    if (now >= exhaustedUntil) {
+      exhaustedConfigs.delete(configId);
+    }
+  }
+}
+
 async function translateLines(apiKeys, lines) {
   const sourceText = lines.map((text, index) => `${index}|||${text}`).join('\n');
+  const hasTags = sourceText.includes('<t0>');
   const prompt = [
     'Translate each numbered line into Vietnamese.',
-    'IMPORTANT: Some lines contain XML-like tags (e.g. <t0>...</t0>, <t1>...</t1>). These represent fragments of a single sentence.',
-    'You MUST preserve all <tX>...</tX> tags exactly. Do not merge, delete, or change the tag names.',
-    'Translate the text inside each tag individually, but use the surrounding tags for context so the whole sentence flows naturally.',
+    hasTags ? 'IMPORTANT: Some lines contain XML-like tags (e.g. <t0>...</t0>, <t1>...</t1>). These represent fragments of a single sentence.' : '',
+    hasTags ? 'You MUST preserve all <tX>...</tX> tags exactly. Do not merge, delete, or change the tag names.' : '',
+    hasTags ? 'Translate the text inside each tag individually, but use the surrounding tags for context so the whole sentence flows naturally.' : '',
     'If a line is ALREADY in Vietnamese, DO NOT translate it. Just return the original text exactly as it is.',
     "Keep the index before '|||' exactly as given.",
     'Return ONLY lines formatted as: <index>|||<vietnamese_text>.',
     'Preserve meaning. Do not add notes, markdown, or blank lines.',
-    'Keep proper nouns and dictionary headwords when appropriate.',
     sourceText,
-  ].join('\n\n');
+  ].filter(Boolean).join('\n\n');
 
-  const pool = buildKeyPool(apiKeys);
+  cleanupExhausted();
+  const pool = buildKeyPoolCached(apiKeys);
   let lastError;
+  let attempts = 0;
 
-  for (const config of pool) {
-    for (const model of config.models) {
-      const configId = `${config.apiKey}|${model}`;
-      const exhaustedUntil = exhaustedConfigs.get(configId) || 0;
-      
-      if (Date.now() < exhaustedUntil) continue;
+  while (attempts < pool.length * 2) {
+    let bestConfig = null;
+    let minConnections = Infinity;
 
-      for (let attempt = 0; attempt < MAX_RETRIES_PER_MODEL; attempt += 1) {
-        try {
-          if (config.provider === 'gemini') {
-            return await callGemini(config.apiKey, model, prompt);
-          } else {
-            return await callOpenAIFormat(config.apiUrl, config.apiKey, model, prompt);
-          }
-        } catch (error) {
-          lastError = error;
+    for (const config of pool) {
+      for (const model of config.models) {
+        const configId = `${config.apiKey}|${model}`;
+        const exhaustedUntil = exhaustedConfigs.get(configId) || 0;
+        
+        if (Date.now() < exhaustedUntil) continue;
 
-          if (error.status === 401 || error.status === 403) {
-            // Invalid key, exhaust all models for this key forever
-            for (const m of config.models) {
-              exhaustedConfigs.set(`${config.apiKey}|${m}`, Date.now() + 365 * 24 * 60 * 60 * 1000);
-            }
-            break; 
-          }
+        const connections = activeConnections.get(configId) || 0;
+        const maxConn = config.provider === 'gemini' ? 2 : 4;
 
-          if (error.status === 429) {
-            let penalty = parseRetryDelayMs(error.raw);
-            if (error.raw?.includes('free_tier') || error.raw?.includes('Quota exceeded')) {
-              penalty = 24 * 60 * 60 * 1000;
-            } else if (config.provider === 'groq') {
-              penalty = Math.max(penalty, 60000); // Wait at least 60s for Groq rate limits
-            }
-            exhaustedConfigs.set(configId, Date.now() + penalty);
-            break; 
-          }
-
-          if (!RETRYABLE_STATUSES.has(error.status)) {
-            break; 
-          }
-
-          if (attempt === MAX_RETRIES_PER_MODEL - 1) {
-            break; 
-          }
-
-          const delay = 2000 * (attempt + 1);
-          await sleep(delay);
+        if (connections < maxConn && connections < minConnections) {
+          minConnections = connections;
+          bestConfig = { config, model, configId };
         }
       }
     }
+
+    if (!bestConfig) {
+      let hasAvailableNotExhausted = false;
+      for (const config of pool) {
+        for (const model of config.models) {
+          const configId = `${config.apiKey}|${model}`;
+          if (Date.now() >= (exhaustedConfigs.get(configId) || 0)) {
+            hasAvailableNotExhausted = true;
+            break;
+          }
+        }
+      }
+
+      if (!hasAvailableNotExhausted) {
+        throw new Error('Tất cả API Keys đều đã cạn kiệt Quota hoặc bị giới hạn tốc độ. Vui lòng thêm Key mới hoặc đợi.');
+      }
+
+      await sleep(1000);
+      continue;
+    }
+
+    activeConnections.set(bestConfig.configId, (activeConnections.get(bestConfig.configId) || 0) + 1);
+    
+    try {
+      if (bestConfig.config.provider === 'gemini') {
+        return await callGemini(bestConfig.config.apiKey, bestConfig.model, prompt);
+      } else {
+        return await callOpenAIFormat(bestConfig.config.apiUrl, bestConfig.config.apiKey, bestConfig.model, prompt);
+      }
+    } catch (error) {
+      lastError = error;
+      attempts++;
+
+      if (error.status === 401 || error.status === 403) {
+        for (const m of bestConfig.config.models) {
+          exhaustedConfigs.set(`${bestConfig.config.apiKey}|${m}`, Date.now() + 365 * 24 * 60 * 60 * 1000);
+        }
+      } else if (error.status === 429) {
+        let penalty = parseRetryDelayMs(error.raw);
+        if (error.raw?.includes('free_tier') || error.raw?.includes('Quota exceeded')) {
+          penalty = 24 * 60 * 60 * 1000;
+        } else if (bestConfig.config.provider === 'groq') {
+          penalty = Math.max(penalty, 60000);
+        }
+        exhaustedConfigs.set(bestConfig.configId, Date.now() + penalty);
+      } else if (RETRYABLE_STATUSES.has(error.status)) {
+        exhaustedConfigs.set(bestConfig.configId, Date.now() + 2000);
+      } else {
+        exhaustedConfigs.set(bestConfig.configId, Date.now() + 10000);
+      }
+    } finally {
+      activeConnections.set(bestConfig.configId, activeConnections.get(bestConfig.configId) - 1);
+    }
   }
 
-  throw lastError ?? new Error('Tất cả API Key và Model đều không khả dụng hoặc đã hết Quota.');
+  throw lastError || new Error('Translation failed after multiple retries.');
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -335,18 +382,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return true;
 });
 
-async function ensureContentScript(tabId) {
-  try {
-    const response = await chrome.tabs.sendMessage(tabId, { type: 'PING' });
-    if (response?.ok) return;
-  } catch {
-    // Lỗi tức là chưa inject
-  }
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    files: ['content.js'],
-  });
-}
+
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({
@@ -371,12 +407,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
   if (info.menuItemId !== 'translate_to_vi') return;
 
-  try {
-    await ensureContentScript(tab.id);
-  } catch (error) {
-    console.error('Không thể inject content script:', error);
-    return;
-  }
+
 
   const { apiKeys, bilingualMode } = await chrome.storage.sync.get(['apiKeys', 'bilingualMode']);
   const keys = apiKeys || [];

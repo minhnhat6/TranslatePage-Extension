@@ -2,14 +2,15 @@
 if (window.__tpContentLoaded) return;
 window.__tpContentLoaded = true;
 
-const MAX_CHARS_PER_BATCH = 4000;
-const CONCURRENCY_LIMIT = 3;
+const CONCURRENCY_LIMIT = 8;
+const MAX_CHARS_PER_BATCH = 6000;
 
 const SKIP_ANCESTOR =
   'script, style, noscript, svg, code, pre, textarea, input, select, option, [contenteditable], .tp-translated-text';
 
 const translatedEntries = [];
 const translationCache = new Map();
+let tpBannerTimeout = null;
 
 // Auto-Translation state
 let dynamicObserver = null;
@@ -124,14 +125,6 @@ function injectStyles() {
   `;
 
   document.documentElement.appendChild(style);
-
-  const observer = new MutationObserver(() => {
-    if (!document.getElementById('tp-styles')) {
-      document.documentElement.appendChild(style);
-    }
-  });
-  observer.observe(document.documentElement, { childList: true });
-  if (document.head) observer.observe(document.head, { childList: true });
 }
 
 function injectFloatingButton() {
@@ -144,14 +137,12 @@ function injectFloatingButton() {
   const target = document.body || document.documentElement;
   target.appendChild(btn);
 
-  const observer = new MutationObserver(() => {
+  setInterval(() => {
     if (!document.getElementById('tp-floating-btn')) {
       const newTarget = document.body || document.documentElement;
       newTarget.appendChild(btn);
     }
-  });
-  observer.observe(document.documentElement, { childList: true });
-  if (document.body) observer.observe(document.body, { childList: true });
+  }, 2000);
 
   let isDragging = false;
   let hasMoved = false;
@@ -252,7 +243,7 @@ function setStatusBanner(text, isError = false) {
     banner.id = 'tp-status-banner';
     banner.addEventListener('click', () => {
       banner.remove();
-      if (window.tpBannerTimeout) clearTimeout(window.tpBannerTimeout);
+      if (tpBannerTimeout) clearTimeout(tpBannerTimeout);
     });
     document.documentElement.appendChild(banner);
   }
@@ -263,8 +254,8 @@ function setStatusBanner(text, isError = false) {
 }
 
 function clearStatusBanner(delayMs = 3000) {
-  if (window.tpBannerTimeout) {
-    clearTimeout(window.tpBannerTimeout);
+  if (tpBannerTimeout) {
+    clearTimeout(tpBannerTimeout);
   }
   
   if (delayMs === 0) {
@@ -272,7 +263,7 @@ function clearStatusBanner(delayMs = 3000) {
     return;
   }
 
-  window.tpBannerTimeout = setTimeout(() => {
+  tpBannerTimeout = setTimeout(() => {
     const banner = document.getElementById('tp-status-banner');
     if (banner && banner.dataset.isError !== 'true') {
       banner.remove();
@@ -281,8 +272,7 @@ function clearStatusBanner(delayMs = 3000) {
 }
 
 function isHidden(el) {
-  const style = getComputedStyle(el);
-  return style.display === 'none' || style.visibility === 'hidden';
+  return el.offsetParent === null && el.tagName !== 'BODY';
 }
 
 function withOriginalWhitespace(original, translated) {
@@ -379,12 +369,19 @@ function applyGroupTranslation(group, translatedContext, bilingualMode) {
   let fullFallbackText = translatedContext;
 
   for (let i = 0; i < group.length; i++) {
-    const regex = new RegExp(`<t${i}>(.*?)</t${i}>`, 's');
-    const match = translatedContext.match(regex);
+    const startTag = `<t${i}>`;
+    const endTag = `</t${i}>`;
+    const startIndex = translatedContext.indexOf(startTag);
+    let endIndex = -1;
+    if (startIndex !== -1) {
+      endIndex = translatedContext.indexOf(endTag, startIndex);
+    }
     
-    if (match) {
-      fullFallbackText = fullFallbackText.replace(match[0], '').trim();
-      applyInPlaceTranslation(group[i], match[1].trim(), bilingualMode);
+    if (startIndex !== -1 && endIndex !== -1) {
+      const matchText = translatedContext.substring(startIndex + startTag.length, endIndex);
+      const fullTag = translatedContext.substring(startIndex, endIndex + endTag.length);
+      fullFallbackText = fullFallbackText.replace(fullTag, '').trim();
+      applyInPlaceTranslation(group[i], matchText.trim(), bilingualMode);
     } else {
       if (i === 0) {
         const plainText = translatedContext.replace(/<t\d+>.*?<\/t\d+>/gs, '').trim();
@@ -494,6 +491,7 @@ async function processDynamicQueue() {
         const translatedContext = translations[String(index)];
         if (!translatedContext) return;
         translationCache.set(batchItem.contextString, translatedContext);
+        if (translationCache.size > 1000) translationCache.clear();
         applyGroupTranslation(batchItem.group, translatedContext, activeBilingualMode);
       });
     }
@@ -551,24 +549,6 @@ function startDynamicObserver(apiKeys, bilingualMode) {
             }
           }
         });
-      } else if (mutation.type === 'characterData') {
-        const node = mutation.target;
-        if (node.nodeType === Node.TEXT_NODE) {
-          const parent = node.parentElement;
-          if (!parent || parent.closest(SKIP_ANCESTOR) || isHidden(parent)) return;
-          const original = node.nodeValue ?? '';
-          const trimmed = original.trim();
-          if (!trimmed || trimmed.length < 2 || !/[a-zA-Z]/.test(trimmed)) return;
-          
-          const group = [{ node, original, trimmed }];
-          const contextString = buildContextString(group);
-          if (translationCache.has(contextString)) {
-            applyGroupTranslation(group, translationCache.get(contextString), activeBilingualMode);
-            return;
-          }
-          dynamicQueue.push(group);
-          hasNewText = true;
-        }
       }
     }
 
@@ -580,8 +560,7 @@ function startDynamicObserver(apiKeys, bilingualMode) {
 
   dynamicObserver.observe(document.body, {
     childList: true,
-    subtree: true,
-    characterData: true
+    subtree: true
   });
 }
 
@@ -752,7 +731,7 @@ async function translateSelectionToVietnamese(apiKeys, bilingualMode) {
   }
 
   const translatedLines = lines.map((_, i) => linesMap.get(i) || lines[i]);
-  const translatedText = translatedLines.join('\n');
+  const translatedText = translatedLines.join('\n').replace(/<\/?t\d+>/g, '');
 
   if (selection.rangeCount > 0) {
     showSelectionPopup(translatedText, selection);

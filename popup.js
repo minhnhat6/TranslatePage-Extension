@@ -108,19 +108,7 @@ bilingualToggle.addEventListener('click', () => {
   chrome.storage.sync.set({ bilingualMode: isActive });
 });
 
-async function ensureContentScript(tabId) {
-  try {
-    const response = await chrome.tabs.sendMessage(tabId, { type: 'PING' });
-    if (response?.ok) return;
-  } catch {
-    // Content script chưa được inject vào tab hiện tại.
-  }
 
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    files: ['content.js'],
-  });
-}
 
 async function handleAction(actionType) {
   if (savedApiKeys.length === 0) {
@@ -145,7 +133,6 @@ async function handleAction(actionType) {
   statusEl.textContent = 'Đang xử lý...';
 
   try {
-    await ensureContentScript(tab.id);
 
     const bilingualMode = bilingualToggle.classList.contains('active');
 
