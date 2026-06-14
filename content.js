@@ -12,13 +12,26 @@ const translatedEntries = [];
 const translationCache = new Map();
 let tpBannerTimeout = null;
 
+function evictCacheIfNeeded() {
+  if (translationCache.size > 1000) {
+    // Remove oldest 20% to avoid sudden full-miss
+    const evictCount = Math.floor(translationCache.size * 0.2);
+    const keys = translationCache.keys();
+    for (let i = 0; i < evictCount; i++) translationCache.delete(keys.next().value);
+  }
+}
+
 // Auto-Translation state
 let dynamicObserver = null;
 let dynamicQueue = [];
 let isProcessingDynamicQueue = false;
 let activeApiKeys = [];
 let activeBilingualMode = false;
+let activeTargetLanguage = 'Vietnamese';
 let dynamicTimeoutId = null;
+let isTranslating = false;
+let extensionEnabled = true; // Always on by default each page load
+
 
 function injectStyles() {
   if (document.getElementById('tp-styles')) return;
@@ -87,11 +100,11 @@ function injectStyles() {
       position: fixed;
       right: 20px;
       bottom: 20px;
-      width: 44px;
-      height: 44px;
+      width: 34px;
+      height: 34px;
       background: #ffffff;
       border-radius: 50%;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+      box-shadow: 0 3px 8px rgba(0, 0, 0, 0.15);
       z-index: 2147483647;
       display: flex;
       align-items: center;
@@ -132,17 +145,20 @@ function injectFloatingButton() {
 
   const btn = document.createElement('div');
   btn.id = 'tp-floating-btn';
-  btn.innerHTML = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/></svg>`;
+  btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/></svg>`;
   
   const target = document.body || document.documentElement;
   target.appendChild(btn);
 
-  setInterval(() => {
+  // Use MutationObserver to re-inject if button is removed by the page
+  const btnObserver = new MutationObserver(() => {
     if (!document.getElementById('tp-floating-btn')) {
       const newTarget = document.body || document.documentElement;
       newTarget.appendChild(btn);
+      if (!extensionEnabled) btn.style.display = 'none';
     }
-  }, 2000);
+  });
+  btnObserver.observe(document.body || document.documentElement, { childList: true, subtree: false });
 
   let isDragging = false;
   let hasMoved = false;
@@ -197,13 +213,15 @@ function injectFloatingButton() {
 
   btn.addEventListener('click', async () => {
     if (hasMoved) return;
+    if (!extensionEnabled) return; // disabled, do nothing
     const isTranslated = translatedEntries.length > 0;
     if (isTranslated) {
       restoreOriginal();
       clearStatusBanner(0);
     } else {
-      chrome.storage.sync.get(['apiKeys', 'bilingualMode'], async ({ apiKeys, bilingualMode }) => {
+      chrome.storage.sync.get(['apiKeys', 'bilingualMode', 'targetLanguage'], async ({ apiKeys, bilingualMode, targetLanguage }) => {
         const keys = apiKeys || [];
+        const targetLang = targetLanguage || 'Vietnamese';
         if (keys.length === 0) {
           setStatusBanner('Vui lòng nhập API Key trong popup trước.', true);
           clearStatusBanner(6000);
@@ -213,7 +231,7 @@ function injectFloatingButton() {
           if (btn.classList.contains('tp-loading')) return;
           btn.classList.add('tp-loading');
           
-          await translatePageToVietnamese(keys, bilingualMode);
+          await translatePageToVietnamese(keys, bilingualMode, targetLang);
         } catch (error) {
           setStatusBanner(error.message, true);
           clearStatusBanner(6000);
@@ -439,12 +457,12 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function translateBatch(apiKeys, items) {
+async function translateBatch(apiKeys, items, targetLanguage) {
   const lines = items.map(item => item.contextString);
 
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
-      { type: 'GEMINI_TRANSLATE_CHUNK', apiKeys, lines },
+      { type: 'GEMINI_TRANSLATE_CHUNK', apiKeys, lines, targetLanguage },
       (response) => {
         if (chrome.runtime.lastError) {
           reject(new Error(chrome.runtime.lastError.message));
@@ -486,12 +504,12 @@ async function processDynamicQueue() {
   try {
     const batches = buildBatches(nodesToProcess);
     for (const batch of batches) {
-      const translations = await translateBatch(activeApiKeys, batch);
+      const translations = await translateBatch(activeApiKeys, batch, activeTargetLanguage);
       batch.forEach((batchItem, index) => {
         const translatedContext = translations[String(index)];
         if (!translatedContext) return;
         translationCache.set(batchItem.contextString, translatedContext);
-        if (translationCache.size > 1000) translationCache.clear();
+        evictCacheIfNeeded();
         applyGroupTranslation(batchItem.group, translatedContext, activeBilingualMode);
       });
     }
@@ -510,10 +528,11 @@ async function processDynamicQueue() {
   }
 }
 
-function startDynamicObserver(apiKeys, bilingualMode) {
+function startDynamicObserver(apiKeys, bilingualMode, targetLanguage = 'Vietnamese') {
   stopDynamicObserver();
   activeApiKeys = apiKeys;
   activeBilingualMode = bilingualMode;
+  activeTargetLanguage = targetLanguage;
 
   dynamicObserver = new MutationObserver((mutations) => {
     let hasNewText = false;
@@ -564,7 +583,7 @@ function startDynamicObserver(apiKeys, bilingualMode) {
   });
 }
 
-async function translatePageToVietnamese(apiKeys, bilingualMode) {
+async function translatePageToVietnamese(apiKeys, bilingualMode, targetLanguage = 'Vietnamese') {
   injectStyles();
   restoreOriginal();
 
@@ -603,14 +622,21 @@ async function translatePageToVietnamese(apiKeys, bilingualMode) {
           );
 
           try {
-            const translations = await translateBatch(apiKeys, batch);
+            const translations = await translateBatch(apiKeys, batch, targetLanguage);
             if (isAborted) return;
 
+            const translatedKeys = Object.keys(translations);
+            const useSequentialFallback = translatedKeys.length === batch.length;
+
             batch.forEach((batchItem, index) => {
-              const translatedContext = translations[String(index)];
+              let translatedContext = translations[String(index)];
+              if (!translatedContext && useSequentialFallback) {
+                translatedContext = translations[translatedKeys[index]];
+              }
               if (!translatedContext) return;
               
               translationCache.set(batchItem.contextString, translatedContext);
+              evictCacheIfNeeded();
               applyGroupTranslation(batchItem.group, translatedContext, bilingualMode);
               translatedCount += batchItem.group.length;
             });
@@ -639,8 +665,9 @@ async function translatePageToVietnamese(apiKeys, bilingualMode) {
     setStatusBanner(summary);
     clearStatusBanner(6000);
   } finally {
+    isTranslating = false;
     updateFloatingButtonState();
-    startDynamicObserver(apiKeys, bilingualMode);
+    startDynamicObserver(apiKeys, bilingualMode, targetLanguage);
   }
 }
 
@@ -660,21 +687,26 @@ function showSelectionPopup(text, selection) {
     }
   });
 
+  // Append with hidden visibility first so offsetWidth is accurate after layout
+  popup.style.visibility = 'hidden';
   document.body.appendChild(popup);
 
   const range = selection.getRangeAt(0);
   const rect = range.getBoundingClientRect();
-  
+
   let top = rect.bottom + window.scrollY + 10;
   let left = rect.left + window.scrollX + (rect.width / 2) - (popup.offsetWidth / 2);
-  
-  if (left < 10) left = 10;
-  if (left + popup.offsetWidth > window.innerWidth - 10) {
-    left = window.innerWidth - popup.offsetWidth - 10;
+
+  // Clamp to viewport
+  const margin = 10;
+  left = Math.max(margin, Math.min(left, window.innerWidth - popup.offsetWidth - margin));
+  if (top + popup.offsetHeight > window.scrollY + window.innerHeight - margin) {
+    top = rect.top + window.scrollY - popup.offsetHeight - 10;
   }
-  
+
   popup.style.top = `${top}px`;
   popup.style.left = `${left}px`;
+  popup.style.visibility = '';
 
   popup.addEventListener('mousedown', (e) => e.stopPropagation());
 
@@ -687,7 +719,7 @@ function showSelectionPopup(text, selection) {
   }, 10);
 }
 
-async function translateSelectionToVietnamese(apiKeys, bilingualMode) {
+async function translateSelectionToVietnamese(apiKeys, bilingualMode, targetLanguage = 'Vietnamese') {
   const selection = window.getSelection();
   const text = selection.toString();
   if (!text.trim()) {
@@ -717,15 +749,24 @@ async function translateSelectionToVietnamese(apiKeys, bilingualMode) {
       type: 'GEMINI_TRANSLATE_CHUNK',
       apiKeys,
       lines: linesToTranslate.map(x => x.line),
+      targetLanguage
     });
 
     if (!response?.ok) {
       throw new Error(response?.error || 'Không thể dịch đoạn text.');
     }
 
+    const translatedKeys = Object.keys(response.translations);
+    const useSequentialFallback = translatedKeys.length === linesToTranslate.length;
+
     linesToTranslate.forEach((x, i) => {
-      const translated = response.translations[String(i)] || x.line;
+      let translated = response.translations[String(i)];
+      if (!translated && useSequentialFallback) {
+        translated = response.translations[translatedKeys[i]];
+      }
+      translated = translated || x.line;
       translationCache.set(x.line, translated);
+      evictCacheIfNeeded();
       linesMap.set(x.index, translated);
     });
   }
@@ -764,10 +805,12 @@ function initQuickTranslate() {
           quickBtn.addEventListener('mousedown', async (ev) => {
             ev.preventDefault();
             ev.stopPropagation();
+            if (!extensionEnabled) return;
             quickBtn.classList.add('tp-loading');
 
-            chrome.storage.sync.get(['apiKeys', 'bilingualMode'], async ({ apiKeys, bilingualMode }) => {
+            chrome.storage.sync.get(['apiKeys', 'bilingualMode', 'targetLanguage'], async ({ apiKeys, bilingualMode, targetLanguage }) => {
               const keys = apiKeys || [];
+              const targetLang = targetLanguage || 'Vietnamese';
               if (keys.length === 0) {
                 setStatusBanner('Vui lòng nhập API Keys trong popup trước.', true);
                 clearStatusBanner(6000);
@@ -776,7 +819,7 @@ function initQuickTranslate() {
                 return;
               }
               try {
-                await translateSelectionToVietnamese(keys, bilingualMode);
+                await translateSelectionToVietnamese(keys, bilingualMode, targetLang);
               } catch (error) {
                 setStatusBanner(error.message, true);
                 clearStatusBanner(6000);
@@ -814,6 +857,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
+  if (message?.type === 'SET_ENABLED') {
+    extensionEnabled = message.enabled;
+    // Show/hide floating button immediately
+    const btn = document.getElementById('tp-floating-btn');
+    if (btn) btn.style.display = extensionEnabled ? '' : 'none';
+    sendResponse({ ok: true });
+    return false;
+  }
+
   if (message?.type === 'REMOVE_TRANSLATIONS') {
     restoreOriginal();
     clearStatusBanner(0);
@@ -829,7 +881,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message?.type === 'TRANSLATE_SELECTION') {
-    translateSelectionToVietnamese(message.apiKeys, message.bilingualMode)
+    if (!extensionEnabled) {
+      sendResponse({ ok: false, error: 'Extension đang bị tắt. Hãy bật lại từ Popup.' });
+      return false;
+    }
+    translateSelectionToVietnamese(message.apiKeys, message.bilingualMode, message.targetLanguage)
       .then(() => sendResponse({ ok: true }))
       .catch((error) => {
         setStatusBanner(error.message, true);
@@ -843,7 +899,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
-  translatePageToVietnamese(message.apiKeys, message.bilingualMode)
+  if (!extensionEnabled) {
+    sendResponse({ ok: false, error: 'Extension đang bị tắt. Hãy bật lại từ Popup.' });
+    return false;
+  }
+
+  translatePageToVietnamese(message.apiKeys, message.bilingualMode, message.targetLanguage)
     .then(() => sendResponse({ ok: true }))
     .catch((error) => {
       setStatusBanner(error.message, true);
@@ -855,8 +916,23 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 injectStyles();
-injectFloatingButton();
 initQuickTranslate();
-updateFloatingButtonState();
+
+// Inject floating button after checking global enabled state from background
+chrome.runtime.sendMessage({ type: 'GET_ENABLED' }, (res) => {
+  if (chrome.runtime.lastError) {
+    // background not ready, default to enabled
+    injectFloatingButton();
+    updateFloatingButtonState();
+    return;
+  }
+  extensionEnabled = res?.enabled !== false;
+  injectFloatingButton();
+  if (!extensionEnabled) {
+    const btn = document.getElementById('tp-floating-btn');
+    if (btn) btn.style.display = 'none';
+  }
+  updateFloatingButtonState();
+});
 
 })();

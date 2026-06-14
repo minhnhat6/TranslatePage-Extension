@@ -1,7 +1,6 @@
 
 
 const RETRYABLE_STATUSES = new Set([429, 500, 503, 504]);
-const MAX_RETRIES_PER_MODEL = 2;
 const exhaustedConfigs = new Map(); // "apiKey|model" -> timestamp
 
 
@@ -26,6 +25,18 @@ function buildRequestBody(prompt, model) {
   }
 
   return body;
+}
+
+if (chrome.storage?.session?.setAccessLevel) {
+  chrome.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS' });
+}
+
+// Broadcast enabled state to all tabs
+async function broadcastEnabled(enabled) {
+  const tabs = await chrome.tabs.query({});
+  for (const tab of tabs) {
+    chrome.tabs.sendMessage(tab.id, { type: 'SET_ENABLED', enabled }).catch(() => {});
+  }
 }
 
 function parseRetryDelayMs(errorText) {
@@ -76,11 +87,9 @@ function formatUserError(status, errorText) {
 
 function parseTranslations(translatedText) {
   const translations = new Map();
+  const lines = translatedText.split('\n').map(l => l.trim()).filter(Boolean);
 
-  for (const line of translatedText.split('\n')) {
-    const trimmedLine = line.trim();
-    if (!trimmedLine) continue;
-
+  for (const trimmedLine of lines) {
     const match = trimmedLine.match(/^(\d+)\|\|\|(.*)$/);
     if (match) {
       translations.set(Number(match[1]), match[2].trim());
@@ -93,17 +102,46 @@ function parseTranslations(translatedText) {
     }
   }
 
+  if (translations.size === 0 && lines.length === 1) {
+    const cleaned = lines[0].replace(/^(Dịch:|Bản dịch:|Translation:)/i, '').trim();
+    translations.set(0, cleaned);
+  }
+
   return translations;
 }
 
-async function callGemini(apiKey, model, prompt) {
-  const response = await fetch(getApiUrl(model), {
-    method: 'POST',
-    headers: {
+async function callApi(config, model, prompt) {
+  let url, headers, body, extractText;
+
+  if (config.provider === 'gemini') {
+    url = getApiUrl(model);
+    headers = { 'Content-Type': 'application/json', 'x-goog-api-key': config.apiKey };
+    body = buildRequestBody(prompt, model);
+    extractText = (data) => {
+      const parts = data?.candidates?.[0]?.content?.parts ?? [];
+      return parts.filter(p => !p.thought).map(p => p.text ?? '').join('\n').trim();
+    };
+  } else if (config.provider === 'anthropic') {
+    url = 'https://api.anthropic.com/v1/messages';
+    headers = {
       'Content-Type': 'application/json',
-      'x-goog-api-key': apiKey,
-    },
-    body: JSON.stringify(buildRequestBody(prompt, model)),
+      'x-api-key': config.apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    };
+    body = { model, max_tokens: 4000, temperature: 0.2, messages: [{ role: 'user', content: prompt }] };
+    extractText = (data) => data?.content?.[0]?.text ?? '';
+  } else {
+    url = config.apiUrl;
+    headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.apiKey}` };
+    body = { model, messages: [{ role: 'user', content: prompt }], temperature: 0.2 };
+    extractText = (data) => data?.choices?.[0]?.message?.content ?? '';
+  }
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
   });
 
   if (!response.ok) {
@@ -115,58 +153,12 @@ async function callGemini(apiKey, model, prompt) {
   }
 
   const data = await response.json();
-  const parts = data?.candidates?.[0]?.content?.parts ?? [];
-  const translatedText = parts
-    .filter((part) => !part.thought)
-    .map((part) => part.text ?? '')
-    .join('\n')
-    .trim();
+  const translatedText = extractText(data);
 
-  if (!translatedText) {
-    throw new Error('Gemini không trả về nội dung dịch.');
-  }
+  if (!translatedText) throw new Error('API không trả về nội dung dịch.');
 
   const translations = parseTranslations(translatedText);
-  if (!translations.size) {
-    throw new Error('Không parse được kết quả dịch từ Gemini.');
-  }
-
-  return translations;
-}
-
-async function callOpenAIFormat(apiUrl, apiKey, model, prompt) {
-  const response = await fetch(apiUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: model,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.2,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    const error = new Error(formatUserError(response.status, errorText));
-    error.status = response.status;
-    error.raw = errorText;
-    throw error;
-  }
-
-  const data = await response.json();
-  const translatedText = data?.choices?.[0]?.message?.content ?? '';
-
-  if (!translatedText) {
-    throw new Error('API không trả về nội dung dịch.');
-  }
-
-  const translations = parseTranslations(translatedText);
-  if (!translations.size) {
-    throw new Error('Không parse được kết quả dịch từ API.');
-  }
+  if (!translations.size) throw new Error('Không parse được kết quả dịch từ API.');
 
   return translations;
 }
@@ -178,7 +170,6 @@ function buildKeyPool(apiKeys) {
     if (key.startsWith('gsk_')) {
       pool.push({
         provider: 'groq',
-        priority: 1,
         apiKey: key,
         apiUrl: 'https://api.groq.com/openai/v1/chat/completions',
         models: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant']
@@ -186,7 +177,6 @@ function buildKeyPool(apiKeys) {
     } else if (key.startsWith('AIza') || key.startsWith('AQ.')) {
       pool.push({
         provider: 'gemini',
-        priority: 2,
         apiKey: key,
         apiUrl: '',
         models: ['gemini-2.0-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-flash']
@@ -194,25 +184,68 @@ function buildKeyPool(apiKeys) {
     } else if (key.startsWith('sk-or-')) {
       pool.push({
         provider: 'openrouter',
-        priority: 3,
         apiKey: key,
         apiUrl: 'https://openrouter.ai/api/v1/chat/completions',
         models: ['meta-llama/llama-3.3-70b-instruct:free', 'openrouter/free']
       });
+    } else if (key.startsWith('sk-ant-')) {
+      pool.push({
+        provider: 'anthropic',
+        apiKey: key,
+        apiUrl: '',
+        models: ['claude-3-5-haiku-20241022', 'claude-3-haiku-20240307']
+      });
+    } else if (key.startsWith('ghp_') || key.startsWith('github_pat_')) {
+      pool.push({
+        provider: 'github',
+        apiKey: key,
+        apiUrl: 'https://models.inference.ai.azure.com/chat/completions',
+        models: ['gpt-4o-mini', 'meta-llama-3.1-70b-instruct', 'cohere-command-r']
+      });
+    } else if (key.startsWith('nvapi-')) {
+      pool.push({
+        provider: 'nvidia',
+        apiKey: key,
+        apiUrl: 'https://integrate.api.nvidia.com/v1/chat/completions',
+        models: ['meta/llama-3.1-70b-instruct', 'meta/llama-3.1-8b-instruct']
+      });
+    } else if (key.startsWith('sk-proj-') || (key.startsWith('sk-') && !key.startsWith('sk-or-') && !key.startsWith('sk-ant-'))) {
+      pool.push({
+        provider: 'openai',
+        apiKey: key,
+        apiUrl: 'https://api.openai.com/v1/chat/completions',
+        models: ['gpt-4o-mini', 'gpt-4o']
+      });
+    } else if (key.startsWith('sta_')) {
+      pool.push({
+        provider: 'freetheai',
+        apiKey: key,
+        apiUrl: 'https://api.freetheai.xyz/v1/chat/completions',
+        models: ['gpt-4o-mini', 'gpt-4o', 'opc/gpt-4o-mini']
+      });
+    } else if (key.startsWith('csk-')) {
+      pool.push({
+        provider: 'cerebras',
+        apiKey: key,
+        apiUrl: 'https://api.cerebras.ai/v1/chat/completions',
+        models: ['llama3.1-70b', 'llama-3.3-70b', 'llama3.3-70b', 'llama3.1-8b', 'gpt-oss-120b', 'zai-glm-4.7']
+      });
+    } else if (/^[A-Za-z0-9]{32}$/.test(key)) {
+      pool.push({
+        provider: 'mistral',
+        apiKey: key,
+        apiUrl: 'https://api.mistral.ai/v1/chat/completions',
+        models: ['mistral-large-latest', 'mistral-small-latest', 'open-mistral-nemo']
+      });
     }
   }
 
-  pool.sort((a, b) => a.priority - b.priority);
   return pool;
 }
 
 let cachedApiKeysJSON = '';
 let cachedKeyPool = [];
 const activeConnections = new Map();
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function buildKeyPoolCached(apiKeys) {
   const json = JSON.stringify(apiKeys);
@@ -232,30 +265,28 @@ function cleanupExhausted() {
   }
 }
 
-async function translateLines(apiKeys, lines) {
+async function translateLines(apiKeys, lines, targetLanguage = 'Vietnamese') {
   const sourceText = lines.map((text, index) => `${index}|||${text}`).join('\n');
   const hasTags = sourceText.includes('<t0>');
   const prompt = [
-    'Translate each numbered line into Vietnamese.',
-    hasTags ? 'IMPORTANT: Some lines contain XML-like tags (e.g. <t0>...</t0>, <t1>...</t1>). These represent fragments of a single sentence.' : '',
-    hasTags ? 'You MUST preserve all <tX>...</tX> tags exactly. Do not merge, delete, or change the tag names.' : '',
-    hasTags ? 'Translate the text inside each tag individually, but use the surrounding tags for context so the whole sentence flows naturally.' : '',
-    'If a line is ALREADY in Vietnamese, DO NOT translate it. Just return the original text exactly as it is.',
-    "Keep the index before '|||' exactly as given.",
-    'Return ONLY lines formatted as: <index>|||<vietnamese_text>.',
-    'Preserve meaning. Do not add notes, markdown, or blank lines.',
+    'You are a professional translator.',
+    `Translate the following numbered lines into ${targetLanguage}.`,
+    hasTags ? 'IMPORTANT: Some lines contain XML-like tags (e.g. <t0>...). Preserve them exactly in the translated text.' : '',
+    "You MUST return the exact same number of lines. Each line MUST start with its original <index>|||.",
+    'DO NOT output any source language text. DO NOT repeat the source text. DO NOT add explanations.',
+    'Format: <index>|||<translation>',
+    '--- SOURCE TEXT ---',
     sourceText,
-  ].filter(Boolean).join('\n\n');
+  ].filter(Boolean).join('\n');
 
   cleanupExhausted();
   const pool = buildKeyPoolCached(apiKeys);
   let lastError;
   let attempts = 0;
+  const totalModels = pool.reduce((acc, config) => acc + config.models.length, 0);
 
-  while (attempts < pool.length * 2) {
+  while (attempts < totalModels * 2) {
     let bestConfig = null;
-    let minConnections = Infinity;
-
     for (const config of pool) {
       for (const model of config.models) {
         const configId = `${config.apiKey}|${model}`;
@@ -266,11 +297,12 @@ async function translateLines(apiKeys, lines) {
         const connections = activeConnections.get(configId) || 0;
         const maxConn = config.provider === 'gemini' ? 2 : 4;
 
-        if (connections < maxConn && connections < minConnections) {
-          minConnections = connections;
+        if (connections < maxConn) {
           bestConfig = { config, model, configId };
+          break;
         }
       }
+      if (bestConfig) break;
     }
 
     if (!bestConfig) {
@@ -296,11 +328,7 @@ async function translateLines(apiKeys, lines) {
     activeConnections.set(bestConfig.configId, (activeConnections.get(bestConfig.configId) || 0) + 1);
     
     try {
-      if (bestConfig.config.provider === 'gemini') {
-        return await callGemini(bestConfig.config.apiKey, bestConfig.model, prompt);
-      } else {
-        return await callOpenAIFormat(bestConfig.config.apiUrl, bestConfig.config.apiKey, bestConfig.model, prompt);
-      }
+      return await callApi(bestConfig.config, bestConfig.model, prompt);
     } catch (error) {
       lastError = error;
       attempts++;
@@ -338,29 +366,47 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return false;
     }
     
-    // We only verify with the first model of the config
-    const model = config.models[0];
     const prompt = 'hi';
     
-    let verifyPromise;
-    if (config.provider === 'gemini') {
-      verifyPromise = callGemini(config.apiKey, model, prompt);
-    } else {
-      verifyPromise = callOpenAIFormat(config.apiUrl, config.apiKey, model, prompt);
+    async function verifyAllModels() {
+      let lastErrorMsg = '';
+      for (const model of config.models) {
+        try {
+          await callApi(config, model, prompt);
+          return { ok: true };
+        } catch (err) {
+          if (err.message.includes('Không parse được') || err.message.includes('không trả về nội dung')) {
+            return { ok: true };
+          }
+          lastErrorMsg = err.message;
+          if (err.message.includes('401') || err.message.includes('403')) {
+            return { ok: false, error: err.message };
+          }
+        }
+      }
+      return { ok: false, error: lastErrorMsg };
     }
     
-    verifyPromise
-      .then(() => sendResponse({ ok: true }))
-      .catch(err => {
-        // Since we didn't send a valid translation prompt, it might fail to parse,
-        // but if it hits the parse error, the connection and auth were SUCCESSFUL!
-        if (err.message.includes('Không parse được') || err.message.includes('không trả về nội dung')) {
-          sendResponse({ ok: true });
-        } else {
-          sendResponse({ ok: false, error: err.message });
-        }
-      });
+    verifyAllModels().then(sendResponse);
       
+    return true;
+  }
+
+  if (message?.type === 'GET_ENABLED') {
+    chrome.storage.session.get(['extensionEnabled'], (data) => {
+      // Default to true if never set (e.g. fresh browser session)
+      const enabled = data.extensionEnabled !== false;
+      sendResponse({ enabled });
+    });
+    return true;
+  }
+
+  if (message?.type === 'SET_ENABLED') {
+    const enabled = message.enabled;
+    chrome.storage.session.set({ extensionEnabled: enabled }, async () => {
+      await broadcastEnabled(enabled);
+      sendResponse({ ok: true });
+    });
     return true;
   }
 
@@ -368,7 +414,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
-  translateLines(message.apiKeys, message.lines)
+  translateLines(message.apiKeys, message.lines, message.targetLanguage)
     .then((translations) => {
       sendResponse({
         ok: true,
@@ -387,7 +433,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({
     id: 'translate_to_vi',
-    title: 'Translate to Tiếng Việt',
+    title: 'Translate Selection',
     contexts: ['page', 'selection'],
   });
   chrome.contextMenus.create({
@@ -407,18 +453,21 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
   if (info.menuItemId !== 'translate_to_vi') return;
 
+  // Check enabled state before translating
+  const sessionData = await chrome.storage.session.get(['extensionEnabled']);
+  if (sessionData.extensionEnabled === false) return;
 
-
-  const { apiKeys, bilingualMode } = await chrome.storage.sync.get(['apiKeys', 'bilingualMode']);
+  const { apiKeys, bilingualMode, targetLanguage } = await chrome.storage.sync.get(['apiKeys', 'bilingualMode', 'targetLanguage']);
   const keys = apiKeys || [];
+  const targetLang = targetLanguage || 'Vietnamese';
   if (keys.length === 0) {
     chrome.tabs.sendMessage(tab.id, { type: 'SHOW_ERROR', message: 'Vui lòng thêm API Key trong popup trước khi dịch.' }).catch(() => {});
     return;
   }
 
   if (info.selectionText) {
-    chrome.tabs.sendMessage(tab.id, { type: 'TRANSLATE_SELECTION', apiKeys: keys, bilingualMode }).catch(() => {});
+    chrome.tabs.sendMessage(tab.id, { type: 'TRANSLATE_SELECTION', apiKeys: keys, bilingualMode, targetLanguage: targetLang }).catch(() => {});
   } else {
-    chrome.tabs.sendMessage(tab.id, { type: 'TRANSLATE_TO_VI', apiKeys: keys, bilingualMode }).catch(() => {});
+    chrome.tabs.sendMessage(tab.id, { type: 'TRANSLATE_TO_VI', apiKeys: keys, bilingualMode, targetLanguage: targetLang }).catch(() => {});
   }
 });

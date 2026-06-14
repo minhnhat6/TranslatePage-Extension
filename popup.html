@@ -59,6 +59,55 @@
         color: var(--accent-pink);
         font-weight: 500;
       }
+      /* Power toggle */
+      .power-btn {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        border: 2px solid #3f3f46;
+        background: var(--card-bg);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: border-color 0.3s, background 0.3s, box-shadow 0.3s;
+      }
+      .power-btn svg {
+        stroke: #71717a;
+        transition: stroke 0.3s;
+      }
+      .power-btn.enabled {
+        border-color: #22c55e;
+        background: rgba(34, 197, 94, 0.1);
+        box-shadow: 0 0 10px rgba(34, 197, 94, 0.3);
+      }
+      .power-btn.enabled svg {
+        stroke: #22c55e;
+      }
+      /* Disabled overlay */
+      .ext-disabled-overlay {
+        position: absolute;
+        inset: 0;
+        background: rgba(18, 18, 18, 0.75);
+        backdrop-filter: blur(2px);
+        border-radius: 8px;
+        z-index: 10;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        gap: 6px;
+        color: var(--text-secondary);
+        font-size: 13px;
+        pointer-events: all;
+      }
+      .ext-disabled-overlay svg {
+        stroke: #71717a;
+      }
+      .main-wrap {
+        position: relative;
+      }
+
       .toggle-switch {
         width: 32px;
         height: 18px;
@@ -234,6 +283,26 @@
       .api-item .delete-btn:hover {
         color: #f43f5e;
       }
+      .api-item .move-btn {
+        background: none;
+        border: none;
+        color: var(--text-muted);
+        cursor: pointer;
+        font-size: 14px;
+        padding: 0 2px;
+      }
+      .api-item .move-btn:hover {
+        color: var(--text-primary);
+      }
+      .api-item .move-btn:disabled {
+        opacity: 0.3;
+        cursor: not-allowed;
+      }
+      .api-item-actions {
+        display: flex;
+        gap: 4px;
+        align-items: center;
+      }
 
       /* Main Action */
       .main-action {
@@ -337,19 +406,34 @@
         <img src="icon48.png" alt="Logo" style="width: 24px; height: 24px; border-radius: 6px;" />
         <span style="font-weight: 600; color: var(--text-primary);">TranslatePage</span>
       </div>
+      <button id="powerBtn" class="power-btn" title="Bật/Tắt Extension">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2v6"/>
+          <path d="M6.8 4.8a9 9 0 1 0 10.4 0"/>
+        </svg>
+      </button>
     </div>
+
+    <!-- Main wrap for disabled overlay -->
+    <div class="main-wrap" id="mainWrap">
 
     <!-- Language Row -->
     <div class="lang-row">
-      <div class="lang-select">
-        English (Auto)
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
+      <div class="lang-select" style="justify-content: center;">
+        Auto Detect
       </div>
       <div class="lang-arrow">→</div>
-      <div class="lang-select">
-        Vietnamese...
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
-      </div>
+      <select id="targetLangSelect" class="lang-select" style="cursor: pointer; color: var(--text-primary); outline: none;">
+        <option value="Vietnamese">Vietnamese</option>
+        <option value="English">English</option>
+        <option value="Chinese">Chinese</option>
+        <option value="Japanese">Japanese</option>
+        <option value="Korean">Korean</option>
+        <option value="French">French</option>
+        <option value="Spanish">Spanish</option>
+        <option value="German">German</option>
+        <option value="Russian">Russian</option>
+      </select>
     </div>
 
     <!-- Settings Box -->
@@ -395,6 +479,8 @@
         Selection...
       </button>
     </div>
+
+    </div><!-- end main-wrap -->
 
     <div id="status"></div>
 

@@ -8,8 +8,46 @@ const bilingualToggle = document.getElementById('bilingualToggle');
 const newApiKeyInput = document.getElementById('newApiKey');
 const addApiBtn = document.getElementById('addApiBtn');
 const apiListContainer = document.getElementById('apiList');
+const targetLangSelect = document.getElementById('targetLangSelect');
+
+const powerBtn = document.getElementById('powerBtn');
+const mainWrap = document.getElementById('mainWrap');
 
 let savedApiKeys = [];
+let extensionEnabled = true;
+
+function applyEnabledState(enabled) {
+  if (enabled) {
+    powerBtn.classList.add('enabled');
+    // Remove overlay if any
+    const overlay = mainWrap.querySelector('.ext-disabled-overlay');
+    if (overlay) overlay.remove();
+  } else {
+    powerBtn.classList.remove('enabled');
+    // Add overlay if not already there
+    if (!mainWrap.querySelector('.ext-disabled-overlay')) {
+      const overlay = document.createElement('div');
+      overlay.className = 'ext-disabled-overlay';
+      overlay.innerHTML = `
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2v6"/>
+          <path d="M6.8 4.8a9 9 0 1 0 10.4 0"/>
+        </svg>
+        <span>Extension đã tắt</span>
+        <span style="font-size:11px;color:#52525b">Bấm nút nguyên để bật lại</span>
+      `;
+      mainWrap.appendChild(overlay);
+    }
+  }
+}
+
+powerBtn.addEventListener('click', () => {
+  extensionEnabled = !extensionEnabled;
+  applyEnabledState(extensionEnabled);
+  // Send to background which will broadcast to all tabs
+  chrome.runtime.sendMessage({ type: 'SET_ENABLED', enabled: extensionEnabled });
+});
+
 
 function renderApiList() {
   apiListContainer.innerHTML = '';
@@ -27,6 +65,27 @@ function renderApiList() {
     } else if (key.startsWith('sk-or-')) {
       provider = 'OpenRouter';
       badgeClass = 'badge-openrouter';
+    } else if (key.startsWith('sk-ant-')) {
+      provider = 'Claude';
+      badgeClass = 'badge-claude';
+    } else if (key.startsWith('ghp_') || key.startsWith('github_pat_')) {
+      provider = 'GitHub';
+      badgeClass = 'badge-github';
+    } else if (key.startsWith('nvapi-')) {
+      provider = 'NVIDIA';
+      badgeClass = 'badge-nvidia';
+    } else if (key.startsWith('sk-proj-') || (key.startsWith('sk-') && !key.startsWith('sk-or-') && !key.startsWith('sk-ant-'))) {
+      provider = 'OpenAI';
+      badgeClass = 'badge-openai';
+    } else if (key.startsWith('sta_')) {
+      provider = 'FreeTheAi';
+      badgeClass = 'badge-freetheai';
+    } else if (key.startsWith('csk-')) {
+      provider = 'Cerebras';
+      badgeClass = 'badge-cerebras';
+    } else if (/^[A-Za-z0-9]{32}$/.test(key)) {
+      provider = 'Mistral';
+      badgeClass = 'badge-mistral';
     }
 
     const item = document.createElement('div');
@@ -36,34 +95,70 @@ function renderApiList() {
         <span class="provider-badge ${badgeClass}">${provider}</span>
         <span>${displayKey}</span>
       </div>
-      <button class="delete-btn" data-index="${index}">X</button>
+      <div class="api-item-actions">
+        <button class="move-btn move-up-btn" data-index="${index}" ${index === 0 ? 'disabled' : ''}>↑</button>
+        <button class="move-btn move-down-btn" data-index="${index}" ${index === savedApiKeys.length - 1 ? 'disabled' : ''}>↓</button>
+        <button class="delete-btn" data-index="${index}">X</button>
+      </div>
     `;
     apiListContainer.appendChild(item);
   });
+
+  const saveAndRender = () => {
+    chrome.storage.sync.set({ apiKeys: savedApiKeys }, renderApiList);
+  };
 
   document.querySelectorAll('.delete-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
       const idx = parseInt(e.target.getAttribute('data-index'), 10);
       savedApiKeys.splice(idx, 1);
-      chrome.storage.sync.set({ apiKeys: savedApiKeys }, renderApiList);
+      saveAndRender();
+    });
+  });
+
+  document.querySelectorAll('.move-up-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const idx = parseInt(e.target.getAttribute('data-index'), 10);
+      if (idx > 0) {
+        [savedApiKeys[idx - 1], savedApiKeys[idx]] = [savedApiKeys[idx], savedApiKeys[idx - 1]];
+        saveAndRender();
+      }
+    });
+  });
+
+  document.querySelectorAll('.move-down-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const idx = parseInt(e.target.getAttribute('data-index'), 10);
+      if (idx < savedApiKeys.length - 1) {
+        [savedApiKeys[idx], savedApiKeys[idx + 1]] = [savedApiKeys[idx + 1], savedApiKeys[idx]];
+        saveAndRender();
+      }
     });
   });
 }
 
-chrome.storage.sync.get(['apiKeys', 'apiKeysText', 'bilingualMode'], (data) => {
-  // Migrate from apiKeysText if exists
+// Load storage data and enabled state in parallel
+applyEnabledState(true); // default while loading
+Promise.all([
+  new Promise(resolve => chrome.storage.sync.get(['apiKeys', 'apiKeysText', 'bilingualMode', 'targetLanguage'], resolve)),
+  new Promise(resolve => chrome.runtime.sendMessage({ type: 'GET_ENABLED' }, res => resolve(res)))
+]).then(([data, enabledRes]) => {
   if (data.apiKeys) {
     savedApiKeys = data.apiKeys;
   } else if (data.apiKeysText) {
     savedApiKeys = data.apiKeysText.split('\n').map(k => k.trim()).filter(k => k);
     chrome.storage.sync.set({ apiKeys: savedApiKeys });
   }
-  
   renderApiList();
+  if (data.bilingualMode) bilingualToggle.classList.add('active');
+  if (data.targetLanguage) targetLangSelect.value = data.targetLanguage;
 
-  if (data.bilingualMode) {
-    bilingualToggle.classList.add('active');
-  }
+  extensionEnabled = enabledRes?.enabled !== false;
+  applyEnabledState(extensionEnabled);
+});
+
+targetLangSelect.addEventListener('change', () => {
+  chrome.storage.sync.set({ targetLanguage: targetLangSelect.value });
 });
 
 addApiBtn.addEventListener('click', async () => {
@@ -135,11 +230,13 @@ async function handleAction(actionType) {
   try {
 
     const bilingualMode = bilingualToggle.classList.contains('active');
+    const targetLanguage = targetLangSelect.value || 'Vietnamese';
 
     const response = await chrome.tabs.sendMessage(tab.id, {
       type: actionType,
       apiKeys,
       bilingualMode,
+      targetLanguage,
     });
 
     if (actionType === 'REMOVE_TRANSLATIONS') {
